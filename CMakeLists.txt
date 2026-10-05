@@ -61,6 +61,8 @@ target_link_libraries(vitacompanion_kernel
   taihenForKernel_stub
   SceCtrlForDriver_stub
   SceThreadmgrForDriver_stub
+  SceKernelSuspendForDriver_stub
+  SceSysmemForDriver_stub
   gcc
 )
 

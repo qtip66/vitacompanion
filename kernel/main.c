@@ -5,6 +5,8 @@
 #include <psp2kern/ctrl.h>
 #include <psp2kern/kernel/modulemgr.h>
 #include <psp2kern/kernel/threadmgr.h>
+#include <psp2kern/kernel/suspend.h>
+#include <psp2kern/kernel/sysmem/data_transfers.h>
 #include <stdint.h>
 #include <taihen.h>
 
@@ -12,7 +14,7 @@
 #define CTRL_EMULATION_SAMPLES 32
 #define FRONT_TOUCH_REPORTS 6
 #define REAR_TOUCH_REPORTS 4
-#define SYNTHETIC_TOUCH_ID_BASE 0x70
+#define SYNTHETIC_TOUCH_ID_BASE 0x01
 #define USER_BUTTON_MASK 0x0000FFFF
 
 typedef struct {
@@ -39,6 +41,16 @@ static tai_hook_ref_t touch_peek_ref;
 static tai_hook_ref_t touch_peek_region_ref;
 static tai_hook_ref_t touch_read_ref;
 static tai_hook_ref_t touch_read_region_ref;
+
+/*
+ * Common dialogs (e.g. the PSN sign-up prompt inside a game) read touch
+ * through the user-only sceTouchPeekRegionExt/sceTouchReadRegionExt syscalls,
+ * which do not go through the ksceTouch* exports hooked above.
+ */
+#define SCE_TOUCH_USER_LIBRARY_NID 0x3E4F4A81
+static SceUID touch_ext_hook_ids[2] = {-1, -1};
+static tai_hook_ref_t touch_peek_region_ext_ref;
+static tai_hook_ref_t touch_read_region_ext_ref;
 
 static void state_lock(void)
 {
@@ -156,6 +168,7 @@ static void patch_touch_data(unsigned int port, SceTouchData *data,
     unsigned int maximum_reports;
     unsigned int buffer_index;
     int slot;
+    int injected = 0;
 
     if (port > VITACOMPANION_TOUCH_REAR || !data)
         return;
@@ -182,7 +195,7 @@ static void patch_touch_data(unsigned int port, SceTouchData *data,
 
             report = &current->report[current->reportNum++];
             report->id = (uint8_t)(SYNTHETIC_TOUCH_ID_BASE + slot);
-            report->force = 0x80;
+            report->force = 0;
             report->x = (int16_t)points[slot].x;
             report->y = (int16_t)points[slot].y;
             report->reserved[0] = 0;
@@ -194,8 +207,13 @@ static void patch_touch_data(unsigned int port, SceTouchData *data,
             report->reserved[6] = 0;
             report->reserved[7] = 0;
             report->info = 0;
+            injected = 1;
         }
     }
+
+    /* Real panel input resets the idle timer; SceShell ignores touches otherwise. */
+    if (injected)
+        ksceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
 }
 
 static int touch_peek_hook(unsigned int port, SceTouchData *data,
@@ -240,8 +258,88 @@ static int touch_read_region_hook(unsigned int port, SceTouchData *data,
     return result;
 }
 
+static int any_touch_active(unsigned int port)
+{
+    int slot;
+    int active = 0;
+
+    if (port > VITACOMPANION_TOUCH_REAR)
+        return 0;
+    state_lock();
+    for (slot = 0; slot < VITACOMPANION_TOUCH_SLOTS; ++slot)
+        active |= touch_states[port][slot].active;
+    state_unlock();
+    return active;
+}
+
+static void patch_user_touch_data(unsigned int port, void *user_data,
+    int count)
+{
+    SceTouchData sample;
+    SceUInt64 previous = 0;
+    int i;
+
+    if (count <= 0 || count > 64 || !user_data || !any_touch_active(port))
+        return;
+
+    for (i = 0; i < count; ++i)
+    {
+        void *user_sample = (char *)user_data + i * sizeof(SceTouchData);
+
+        if (ksceKernelCopyFromUser(&sample, user_sample, sizeof(sample)) < 0)
+            return;
+        /* Bail out unless this really is a SceTouchData history. */
+        if (sample.reportNum > SCE_TOUCH_MAX_REPORT ||
+            sample.timeStamp < previous)
+            return;
+        previous = sample.timeStamp;
+
+        patch_touch_data(port, &sample, 1);
+        if (ksceKernelCopyToUser(user_sample, &sample, sizeof(sample)) < 0)
+            return;
+    }
+}
+
+static int touch_peek_region_ext_hook(unsigned int port, void *data,
+    unsigned int count, int region)
+{
+    int result = TAI_CONTINUE(int, touch_peek_region_ext_ref,
+        port, data, count, region);
+
+    if (result > 0)
+        patch_user_touch_data(port, data, result);
+    return result;
+}
+
+static int touch_read_region_ext_hook(unsigned int port, void *data,
+    unsigned int count, int region)
+{
+    int result = TAI_CONTINUE(int, touch_read_region_ext_ref,
+        port, data, count, region);
+
+    if (result > 0)
+        patch_user_touch_data(port, data, result);
+    return result;
+}
+
+static void install_touch_ext_hooks(const char *module_name)
+{
+    touch_ext_hook_ids[0] = taiHookFunctionExportForKernel(KERNEL_PID,
+        &touch_peek_region_ext_ref, module_name, SCE_TOUCH_USER_LIBRARY_NID,
+        0x2CF6D7E2, touch_peek_region_ext_hook);
+    touch_ext_hook_ids[1] = taiHookFunctionExportForKernel(KERNEL_PID,
+        &touch_read_region_ext_ref, module_name, SCE_TOUCH_USER_LIBRARY_NID,
+        0x9F0ACAF9, touch_read_region_ext_hook);
+}
+
 static void release_touch_hooks(void)
 {
+    if (touch_ext_hook_ids[1] >= 0)
+        taiHookReleaseForKernel(touch_ext_hook_ids[1], touch_read_region_ext_ref);
+    if (touch_ext_hook_ids[0] >= 0)
+        taiHookReleaseForKernel(touch_ext_hook_ids[0], touch_peek_region_ext_ref);
+    touch_ext_hook_ids[0] = touch_ext_hook_ids[1] = -1;
+
     tai_hook_ref_t *refs[] = {
         &touch_peek_ref,
         &touch_peek_region_ref,
@@ -306,6 +404,7 @@ static int install_touch_hooks(void)
         }
     }
 
+    install_touch_ext_hooks(module_name);
     return 0;
 }
 
