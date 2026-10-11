@@ -5,11 +5,14 @@
  * One client at a time, one request line per reply:
  *   GRAB x y w h shift   -> u32 length, then VcFrameHeader + RGB565 pixels
  *                           (w/h 0 = to the edge, shift 0..3 = 1/1..1/8 size)
- *   DELTA shift          -> u32 length, then VcFrameHeader, a bitmap of
+ *   DELTA shift [y h]    -> u32 length, then VcFrameHeader, a bitmap of
  *                           changed rows ((out_h + 7) / 8 bytes, LSB first)
- *                           and those rows' pixels, top to bottom. Rows are compared with
- *                           the previous DELTA on this connection; the first
- *                           one (or a new shift) sends every row.
+ *                           and those rows' pixels, top to bottom. Full width;
+ *                           y/h pick a band of source rows (h 0 = to the bottom)
+ *                           so a full-size frame fits the buffer in pieces.
+ *                           Rows are compared with the last DELTA of the same
+ *                           shift on this connection; the first sends every row.
+ *   INFO                 -> one text line: api, buffer size, proto=2
  * An error reply is u32 0xFFFFFFFF followed by the i32 result code.
  * The buffer is allocated per connection, so SceShell holds no memory
  * while nobody is watching.
@@ -32,8 +35,7 @@ extern volatile int run;
 static SceUID screen_thid = -1;
 static int screen_sockfd = -1;
 static volatile int screen_client_sockfd = -1;
-static uint32_t row_hash[SCREEN_MAX_ROWS];
-static int hash_shift = -1;
+static uint32_t row_hash[4][SCREEN_MAX_ROWS];   /* per shift, so a half-size stream and full-size shots can mix */
 
 static int send_all(int s, const void *data, unsigned int len)
 {
@@ -115,7 +117,8 @@ static int handle_grab(int s, uint8_t *buf, unsigned int cap, const char *args)
 
 static int handle_delta(int s, uint8_t *buf, unsigned int cap, const char *args)
 {
-    unsigned int shift = 1;
+    unsigned int v[3] = {1, 0, 0};   /* shift, first source row, source rows (0 = to the bottom) */
+    unsigned int shift, first;
     VcFrameHeader hdr;
     uint8_t head[4 + sizeof(VcFrameHeader)];
     uint8_t bits[(SCREEN_MAX_ROWS + 7) / 8];
@@ -124,18 +127,17 @@ static int handle_delta(int s, uint8_t *buf, unsigned int cap, const char *args)
     int n;
     uint32_t len;
 
-    parse_uints(args, &shift, 1);
-    n = vitaCompanionKernelGrabFrame(buf, cap, 0, shift & 0xff);
+    parse_uints(args, v, 3);
+    shift = v[0];
+    if (shift > 3 || v[1] > 0xfff || v[2] > 0xfff)
+        return send_error(s, -100);
+    n = vitaCompanionKernelGrabFrame(buf, cap, v[1] & 0xffff, (v[2] << 8) | shift);
     if (n < 0)
         return send_error(s, n);
     memcpy(&hdr, buf, sizeof(hdr));
-    if (hdr.out_h > SCREEN_MAX_ROWS)
+    first = (unsigned int)hdr.y >> shift;
+    if (first + hdr.out_h > SCREEN_MAX_ROWS)
         return send_error(s, -101);
-    if ((int)shift != hash_shift)
-    {
-        memset(row_hash, 0, sizeof(row_hash));
-        hash_shift = (int)shift;
-    }
 
     /* Changed rows are packed towards the start (destination never after the
        source, so increasing order is safe), then sent after the bitmap. */
@@ -147,9 +149,9 @@ static int handle_delta(int s, uint8_t *buf, unsigned int cap, const char *args)
     {
         uint8_t *src = pixels + row * row_bytes;
         uint32_t h = fnv1a(src, row_bytes) | 1u;  /* never 0, the "unknown" value */
-        if (h != row_hash[row])
+        if (h != row_hash[shift][first + row])
         {
-            row_hash[row] = h;
+            row_hash[shift][first + row] = h;
             bits[row >> 3] |= (uint8_t)(1u << (row & 7));
             if (changed != row)
                 memmove(pixels + changed * row_bytes, src, row_bytes);
@@ -186,7 +188,7 @@ static void serve_client(int s)
             sceKernelFreeMemBlock(block);
         return;
     }
-    hash_shift = -1;
+    memset(row_hash, 0, sizeof(row_hash));
 
     while (run && recv_line(s, line, sizeof(line)) >= 0)
     {
@@ -198,7 +200,7 @@ static void serve_client(int s)
         else if (strncmp(line, "INFO", 4) == 0)
         {
             char msg[64];
-            snprintf(msg, sizeof(msg), "vitacompanion screen api=%d buf=%u\n",
+            snprintf(msg, sizeof(msg), "vitacompanion screen api=%d buf=%u proto=2\n",
                 vitaCompanionKernelGetApiVersion(), cap);
             r = send_all(s, msg, strlen(msg));
         }
