@@ -26,9 +26,10 @@ int __unused module_start(SceSize argc, const void* args)
     (void)argc;
     (void)args;
 
-    result = input_start();
-    if (result < 0)
-        return result;
+    /* Without the kernel module (missing, or a different ABI) input is off,
+       but FTP and the command port still start so the device can be fixed
+       remotely. */
+    input_start();
 
     // Required for ftpvita
     result = taipool_init(1 * 1024 * 1024);

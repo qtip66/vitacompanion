@@ -3,11 +3,15 @@
 
 #include <psp2/touch.h>
 #include <psp2kern/ctrl.h>
+#include <psp2kern/display.h>
+#include <psp2kern/kernel/cpu.h>
+#include <psp2kern/kernel/sysmem.h>
 #include <psp2kern/kernel/modulemgr.h>
 #include <psp2kern/kernel/threadmgr.h>
 #include <psp2kern/kernel/suspend.h>
 #include <psp2kern/kernel/sysmem/data_transfers.h>
 #include <stdint.h>
+#include <string.h>
 #include <taihen.h>
 
 #define CTRL_REFRESH_US (8 * 1000)
@@ -471,6 +475,115 @@ int vitaCompanionKernelReset(void)
     return 0;
 }
 
+/* ---- screen capture -------------------------------------------------------------------- */
+#define FB_ROW_BUF_SIZE 0x4000   /* one source row (<= 1024 px * 4) + one output row */
+static SceUID fb_mutex = -1;
+static SceUID fb_buf_uid = -1;
+static uint8_t *fb_buf;
+
+static int framebuffer_info(SceDisplayFrameBufInfo *info)
+{
+    int head = ksceDisplayGetPrimaryHead();
+    int index;
+
+    /* index 0 is normally the foreground application; some states only fill index 1 */
+    for (index = 0; index < 2; ++index)
+    {
+        memset(info, 0, sizeof(*info));
+        info->size = sizeof(*info);
+        if (ksceDisplayGetProcFrameBufInternal(-1, head, index, info) >= 0 &&
+            info->framebuf.base != NULL && info->framebuf.width && info->framebuf.height)
+            return 0;
+    }
+    return -1;
+}
+
+static int grab_frame(void *dst, uint32_t dst_size, uint32_t xy, uint32_t wh_shift)
+{
+    SceDisplayFrameBufInfo info;
+    VcFrameHeader hdr;
+    uint32_t x0 = xy >> 16, y0 = xy & 0xffff;
+    uint32_t w = wh_shift >> 20, h = (wh_shift >> 8) & 0xfff, shift = wh_shift & 0xff;
+    uint32_t step, out_w, out_h, row, col, pitch_bytes;
+    uint32_t *src_row;
+    uint16_t *out_row;
+    uint8_t *out;
+
+    if (shift > 3)
+        return -2;
+    if (framebuffer_info(&info) < 0)
+        return -3;
+    if (x0 >= info.framebuf.width || y0 >= info.framebuf.height)
+        return -4;
+    if (w == 0 || x0 + w > info.framebuf.width)
+        w = info.framebuf.width - x0;
+    if (h == 0 || y0 + h > info.framebuf.height)
+        h = info.framebuf.height - y0;
+    step = 1u << shift;
+    out_w = w >> shift;
+    out_h = h >> shift;
+    if (out_w == 0 || out_h == 0 || w * 4 + out_w * 2 > FB_ROW_BUF_SIZE)
+        return -5;
+    if (dst_size < sizeof(hdr) + out_w * out_h * 2)
+        return -6;
+
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = VITACOMPANION_FRAME_MAGIC;
+    hdr.src_w = info.framebuf.width;
+    hdr.src_h = info.framebuf.height;
+    hdr.x = x0;
+    hdr.y = y0;
+    hdr.out_w = out_w;
+    hdr.out_h = out_h;
+    hdr.pixelformat = info.framebuf.pixelformat;
+    hdr.pid = info.pid;
+    if (ksceKernelCopyToUser(dst, &hdr, sizeof(hdr)) < 0)
+        return -7;
+
+    if (fb_buf == NULL)
+    {
+        fb_buf_uid = ksceKernelAllocMemBlock("vitacompanion_fb",
+            SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_RW, FB_ROW_BUF_SIZE, NULL);
+        if (fb_buf_uid < 0 || ksceKernelGetMemBlockBase(fb_buf_uid, (void **)&fb_buf) < 0)
+            return -8;
+    }
+    src_row = (uint32_t *)fb_buf;
+    out_row = (uint16_t *)(fb_buf + w * 4);
+    out = (uint8_t *)dst + sizeof(hdr);
+    pitch_bytes = info.framebuf.pitch * 4;
+
+    for (row = 0; row < out_h; ++row)
+    {
+        const uint8_t *src = (const uint8_t *)info.framebuf.base +
+            (y0 + row * step) * pitch_bytes + x0 * 4;
+        if (ksceKernelCopyFromUserProc(info.pid, src_row, src, w * 4) < 0)
+            return -9;
+        for (col = 0; col < out_w; ++col)
+        {
+            uint32_t p = src_row[col * step];    /* A8B8G8R8: R in the low byte */
+            out_row[col] = (uint16_t)(((p & 0xf8) << 8) | ((p >> 5) & 0x7e0) | ((p >> 19) & 0x1f));
+        }
+        if (ksceKernelCopyToUser(out + row * out_w * 2, out_row, out_w * 2) < 0)
+            return -10;
+    }
+    return (int)(sizeof(hdr) + out_w * out_h * 2);
+}
+
+int vitaCompanionKernelGrabFrame(void *dst, uint32_t dst_size, uint32_t xy, uint32_t wh_shift)
+{
+    uint32_t state;
+    int result;
+
+    ENTER_SYSCALL(state);
+    if (fb_mutex >= 0)
+        ksceKernelLockMutex(fb_mutex, 1, NULL);
+    result = grab_frame(dst, dst_size, xy, wh_shift);
+    if (fb_mutex >= 0)
+        ksceKernelUnlockMutex(fb_mutex, 1);
+    EXIT_SYSCALL(state);
+    return result;
+}
+
 int module_start(SceSize argc, const void *args)
 {
     int result;
@@ -483,6 +596,7 @@ int module_start(SceSize argc, const void *args)
         "vitacompanion_input_mutex", 0, 0, NULL);
     if (state_mutex < 0)
         return SCE_KERNEL_START_FAILED;
+    fb_mutex = ksceKernelCreateMutex("vitacompanion_fb_mutex", 0, 0, NULL);
 
     result = install_touch_hooks();
     if (result < 0)
@@ -542,6 +656,17 @@ int module_stop(SceSize argc, const void *args)
     {
         ksceKernelDeleteMutex(state_mutex);
         state_mutex = -1;
+    }
+    if (fb_buf_uid >= 0)
+    {
+        ksceKernelFreeMemBlock(fb_buf_uid);
+        fb_buf_uid = -1;
+        fb_buf = NULL;
+    }
+    if (fb_mutex >= 0)
+    {
+        ksceKernelDeleteMutex(fb_mutex);
+        fb_mutex = -1;
     }
 
     return SCE_KERNEL_STOP_SUCCESS;

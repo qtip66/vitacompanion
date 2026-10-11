@@ -14,6 +14,7 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITACOMPANION_FTP_PORT 1337 CACHE STRING "FTP control port")
 set(VITACOMPANION_CMD_PORT 1338 CACHE STRING "Command server port")
+set(VITACOMPANION_SCREEN_PORT 1339 CACHE STRING "Screen server port")
 set(VITACOMPANION_MODULE_NAME "vitacompanion" CACHE STRING "Vita module name")
 
 if(NOT VITACOMPANION_FTP_PORT MATCHES "^[0-9]+$" OR
@@ -63,6 +64,8 @@ target_link_libraries(vitacompanion_kernel
   SceThreadmgrForDriver_stub
   SceKernelSuspendForDriver_stub
   SceSysmemForDriver_stub
+  SceDisplayForDriver_stub
+  SceSysclibForDriver_stub
   gcc
 )
 
@@ -96,13 +99,16 @@ add_executable(vitacompanion
         src/version.c
         src/version.h
         src/cmd_definitions.c
-        src/cmd_definitions.h)
+        src/cmd_definitions.h
+        src/screen.c
+        src/screen.h)
 
 target_compile_definitions(ftpvita PRIVATE
   FTP_PORT=${VITACOMPANION_FTP_PORT}
 )
 target_compile_definitions(vitacompanion PRIVATE
   CMD_PORT=${VITACOMPANION_CMD_PORT}
+  SCREEN_PORT=${VITACOMPANION_SCREEN_PORT}
 )
 
 add_dependencies(vitacompanion vitacompanion_kernel_stubs)
@@ -113,6 +119,7 @@ target_link_libraries(vitacompanion
   k
   gcc
   SceLibKernel_stub_weak
+  SceSysmem_stub_weak
   SceNet_stub_weak
   SceNetCtl_stub_weak
   SceSysmodule_stub_weak
@@ -123,7 +130,7 @@ target_link_libraries(vitacompanion
   SceKernelModulemgr_stub
   SceProcessmgr_stub_weak
   ScePower_stub
-  ${CMAKE_CURRENT_BINARY_DIR}/libvitacompanion_kernel_stub.a
+  ${CMAKE_CURRENT_BINARY_DIR}/libvitacompanion_kernel_stub_weak.a
 )
 
 set_target_properties(vitacompanion

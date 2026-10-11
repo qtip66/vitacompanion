@@ -2,6 +2,7 @@
 
 #include "cmd.h"
 #include "log.h"
+#include "screen.h"
 
 #include <ftpvita.h>
 #include <vitasdk.h>
@@ -46,6 +47,7 @@ void net_end()
 
     if (all_is_up)
     {
+        screen_end();
         cmd_end();
         ftpvita_fini();
         all_is_up = 0;
@@ -83,6 +85,7 @@ static void do_net_connected()
 
         if (cmd_start() >= 0)
         {
+            screen_start();   /* optional: FTP and commands work without it */
             all_is_up = 1;
         }
         else
@@ -110,6 +113,7 @@ static void netctl_cb(int event_type, void* arg)
     if (state != 3 && all_is_up)
     {
         net_connected = 0;
+        screen_end();
         cmd_end();
         ftpvita_fini();
         all_is_up = 0;
@@ -144,9 +148,17 @@ int net_thread(unsigned int args, void* argp)
         return ret;
 
     netctl_cb(0, NULL);
+    int tick = 0;
     while (run)
     {
         sceNetCtlCheckCallback();
+        /* A Wi-Fi blip tears the servers down; if bringing them back fails (seen after RetroArch crashes: ping
+           answers, every port refuses) netctl sends no further event. Retry every 5 s while they are down. */
+        if (!all_is_up && ++tick >= 5)
+        {
+            tick = 0;
+            netctl_cb(0, NULL);
+        }
         sceKernelDelayThread(1000 * 1000);
     }
 
